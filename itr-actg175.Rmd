@@ -1,0 +1,393 @@
+---
+title: "itr-actg175"
+author: "yichen xu"
+date: "2024-11-02"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+# basics
+1. resource constraints to try
+2. category treatment
+
+
+# interesting research question
+* 1. which covariate to choose? how to set V? variable importance? any group-wise difference? 
+
+
+# question
+1. Here do we use stochastic rule?
+2. How do the alg determine the suboptimal rule if realistic = True or maximize = False
+3. How to output blip functions?
+
+# plan
+1. reduce number of V (different combinations)
+2. plot the causl estimand with more resource constraints
+
+# check data
+
+```{r}
+library(BART)
+
+data(ACTG175)
+
+?ACTG175
+```
+
+Y: cd420
+W: age, wtkg, hemo, homo, drugs, karnof, oprior, z30, zprior, preanti, race, gender, str2, strat, cd80
+A: treat
+
+
+
+# fit the basic model
+
+```{r}
+
+
+library(data.table)
+library(sl3)
+library(tmle3)
+library(tmle3mopttx)
+
+
+data <- read.csv("actg175.csv")
+
+mean(data$cd420)
+
+node_list <- list(
+  W = c("age", "wtkg", "hemo", "homo", "drugs", "karnof", "oprior", "z30", 
+        "zprior", "preanti", "race", "gender", "str2", "strat", "cd80"),
+  A = "treat",
+  Y = "cd420"
+)
+
+
+lrn_mean <- Lrnr_mean$new()
+lrn_glm <- Lrnr_glm_fast$new()
+lrn_xgboost_50 <- Lrnr_xgboost$new(nrounds = 50)
+lrn_hal <- Lrnr_hal9001$new(max_degree = 2, num_knots = rep(5, length(node_list$W)))
+
+
+Q_learner <- Lrnr_sl$new(
+  learners = list(lrn_glm, lrn_mean, lrn_xgboost_50, lrn_hal),
+  metalearner = Lrnr_nnls$new()
+)
+
+
+g_learner <- Lrnr_sl$new(
+  learners = list(lrn_glm, lrn_mean, lrn_xgboost_50, lrn_hal),
+  metalearner = Lrnr_nnls$new()
+)
+
+
+b_learner <- Lrnr_sl$new(
+  learners = list(lrn_glm, lrn_mean, lrn_xgboost_50, lrn_hal),
+  metalearner = Lrnr_nnls$new()
+)
+
+
+learner_list <- list(Y = Q_learner, A = g_learner, B = b_learner)
+
+
+tmle_spec <- tmle3_mopttx_blip_revere(
+  V = c("age", "wtkg", "hemo", "homo", "drugs", "karnof", "oprior", "z30", 
+        "zprior", "preanti", "race", "gender", "str2", "strat", "cd80"), 
+  type = "blip1",  
+  learners = learner_list,
+  maximize = TRUE,
+  complex = TRUE,
+  realistic = TRUE,
+  resource = 1,
+  interpret = TRUE
+)
+
+
+fit <- tmle3(tmle_spec, data, node_list, learner_list)
+
+
+print(fit)
+
+
+
+```
+
+
+# extract rules of basic model
+
+```{r}
+
+table(tmle_spec$return_rule)
+zero_indices <- which(tmle_spec$return_rule == 0)
+print(zero_indices)
+
+```
+
+
+# check the positivity assumption
+
+```{r}
+
+library(data.table)
+library(sl3)
+
+
+# Define learners for Super Learner
+lrn_mean <- Lrnr_mean$new()
+lrn_glm <- Lrnr_glm_fast$new()
+lrn_xgboost_50 <- Lrnr_xgboost$new(nrounds = 50)
+lrn_hal <- Lrnr_hal9001$new(max_degree = 2, num_knots = rep(5, length(node_list$W)))
+
+# Define the Super Learner for the propensity score model
+g_learner <- Lrnr_sl$new(
+  learners = list(lrn_glm, lrn_mean, lrn_xgboost_50, lrn_hal),
+  metalearner = Lrnr_nnls$new()
+)
+
+# Create a task for the propensity score estimation
+g_task <- sl3_Task$new(
+  data = data,
+  covariates = node_list$W,
+  outcome = node_list$A,
+  outcome_type = "binomial"
+)
+
+# Train the Super Learner on the task
+g_fit <- g_learner$train(g_task)
+
+# Predict propensity scores P(A = 1 | W)
+propensity_scores <- g_fit$predict()
+
+# Compute 1 / P(A = 1 | W)
+inv_propensity_scores <- 1 / propensity_scores
+
+# Plot the histogram of 1 / P(A = 1 | W)
+hist(inv_propensity_scores, 
+     main = "Distribution of 1 / P(A = 1 | W)",
+     xlab = "1 / P(A = 1 | W)",
+     col = "lightblue", 
+     border = "white", 
+     breaks = 30)
+
+```
+
+
+
+
+
+
+
+# resource constraint 
+
+```{r}
+
+# resource constraints: 0.9, 0.8, 0.7, 0.6, 0.5
+# store fit$summary$lower, fit$summary$upper, fit$init_est, fit$tmle_est
+
+
+resource_constraints <- c(0.9, 0.8, 0.7, 0.6, 0.5)
+
+results_matrix <- matrix(NA, nrow = length(resource_constraints), ncol = 4)
+colnames(results_matrix) <- c("lower", "upper", "init_est", "tmle_est")
+rownames(results_matrix) <- resource_constraints
+
+for (i in seq_along(resource_constraints)) {
+  resource_constraint <- resource_constraints[i]
+  
+  tmle_spec <- tmle3_mopttx_blip_revere(
+    V = c("age", "wtkg", "hemo", "homo", "drugs", "karnof", "oprior", "z30", 
+          "zprior", "preanti", "race", "gender", "str2", "strat", "cd80"), 
+    type = "blip1",  
+    learners = learner_list,
+    maximize = TRUE,
+    complex = TRUE,
+    realistic = TRUE,
+    resource = resource_constraint
+  )
+  
+  fit <- tmle3(tmle_spec, data, node_list, learner_list)
+  
+  fit_summary <- fit$summary
+  results_matrix[i, ] <- c(fit_summary$lower, fit_summary$upper, fit_summary$init_est, fit_summary$tmle_est)
+}
+
+results_df <- as.data.frame(results_matrix)
+results_df$resource_constraint <- resource_constraints
+
+library(ggplot2)
+
+ggplot(results_df, aes(x = resource_constraint)) +
+  geom_point(aes(y = tmle_est, color = "TMLE Estimate"), size = 3) +
+  geom_point(aes(y = init_est, color = "Initial Estimate"), size = 3) +
+  geom_errorbar(aes(ymin = lower, ymax = upper, color = "TMLE Estimate"), width = 0.05) +
+  scale_x_reverse() +
+  labs(title = "TMLE and Initial Estimates with Confidence Intervals Across Resource Constraints",
+       x = "Resource Constraint",
+       y = "Estimate",
+       color = "Legend") +
+  theme_minimal()
+
+```
+
+
+
+# cd496
+
+```{r}
+
+library(dplyr)
+
+data_clean_na <- data  %>% filter(!is.na(cd496))
+
+mean(data_clean_na$cd496)
+
+node_list_96 <- list(
+  W = c("age", "wtkg", "hemo", "homo", "drugs", "karnof", "oprior", "z30", 
+        "zprior", "preanti", "race", "gender", "str2", "strat", "cd80"),
+  A = "treat",
+  Y = "cd496"
+)
+
+
+lrn_mean <- Lrnr_mean$new()
+lrn_glm <- Lrnr_glm_fast$new()
+lrn_xgboost_50 <- Lrnr_xgboost$new(nrounds = 50)
+lrn_hal <- Lrnr_hal9001$new(max_degree = 2, num_knots = rep(5, length(node_list$W)))
+
+
+Q_learner <- Lrnr_sl$new(
+  learners = list(lrn_glm, lrn_mean, lrn_xgboost_50, lrn_hal),
+  metalearner = Lrnr_nnls$new()
+)
+
+
+g_learner <- Lrnr_sl$new(
+  learners = list(lrn_glm, lrn_mean, lrn_xgboost_50, lrn_hal),
+  metalearner = Lrnr_nnls$new()
+)
+
+
+b_learner <- Lrnr_sl$new(
+  learners = list(lrn_glm, lrn_mean, lrn_xgboost_50, lrn_hal),
+  metalearner = Lrnr_nnls$new()
+)
+
+
+learner_list <- list(Y = Q_learner, A = g_learner, B = b_learner)
+
+
+tmle_spec_96 <- tmle3_mopttx_blip_revere(
+  V = c("age", "wtkg", "hemo", "homo", "drugs", "karnof", "oprior", "z30", 
+        "zprior", "preanti", "race", "gender", "str2", "strat", "cd80"), 
+  type = "blip1",  
+  learners = learner_list,
+  maximize = TRUE,
+  complex = TRUE,
+  realistic = TRUE,
+  resource = 1,
+  interpret = TRUE
+)
+
+
+fit_96 <- tmle3(tmle_spec_96, data_clean_na, node_list_96, learner_list)
+
+
+print(fit_96)
+
+
+table(tmle_spec_96$return_rule)
+
+
+
+
+```
+
+```{r}
+
+library(ggplot2)
+
+# Extract predictions
+blip_predictions <- tmle_spec_96$blip_fit$predict()
+
+# Combine into a data frame for ggplot2
+plot_data <- data.frame(cd80 = data_clean_na$cd80, blip_predictions = blip_predictions)
+
+# Create scatter plot with smooth curve
+ggplot(plot_data, aes(x = cd80, y = blip_predictions)) +
+  geom_point(alpha = 0.6) +  # Points
+  geom_smooth(method = "loess", se = FALSE, color = "blue") +  # Smooth curve
+  labs(
+    title = "Blip Predictions vs. cd80",
+    x = "cd80",
+    y = "Blip Predictions"
+  ) +
+  theme_minimal()
+
+
+```
+
+
+```{r}
+
+hist(tmle_spec_96$blip_fit$predict())
+
+```
+
+
+
+```{r}
+
+
+# resource constraints: 0.9, 0.8, 0.7, 0.6, 0.5
+# store fit$summary$lower, fit$summary$upper, fit$init_est, fit$tmle_est
+
+
+resource_constraints <- c(0.9, 0.8, 0.7, 0.6, 0.5)
+
+results_matrix <- matrix(NA, nrow = length(resource_constraints), ncol = 4)
+colnames(results_matrix) <- c("lower", "upper", "init_est", "tmle_est")
+rownames(results_matrix) <- resource_constraints
+
+for (i in seq_along(resource_constraints)) {
+  resource_constraint <- resource_constraints[i]
+  
+  tmle_spec <- tmle3_mopttx_blip_revere(
+    V = c("age", "wtkg", "hemo", "homo", "drugs", "karnof", "oprior", "z30", 
+          "zprior", "preanti", "race", "gender", "str2", "strat", "cd80"), 
+    type = "blip1",  
+    learners = learner_list,
+    maximize = TRUE,
+    complex = TRUE,
+    realistic = TRUE,
+    resource = resource_constraint
+  )
+  
+  fit <- tmle3(tmle_spec_96, data_clean_na, node_list_96, learner_list)
+  
+  fit_summary <- fit$summary
+  results_matrix[i, ] <- c(fit_summary$lower, fit_summary$upper, fit_summary$init_est, fit_summary$tmle_est)
+}
+
+results_df <- as.data.frame(results_matrix)
+results_df$resource_constraint <- resource_constraints
+
+library(ggplot2)
+
+ggplot(results_df, aes(x = resource_constraint)) +
+  geom_point(aes(y = tmle_est, color = "TMLE Estimate"), size = 3) +
+  geom_point(aes(y = init_est, color = "Initial Estimate"), size = 3) +
+  geom_errorbar(aes(ymin = lower, ymax = upper, color = "TMLE Estimate"), width = 0.05) +
+  scale_x_reverse() +
+  labs(title = "TMLE and Initial Estimates with Confidence Intervals Across Resource Constraints",
+       x = "Resource Constraint",
+       y = "Estimate",
+       color = "Legend") +
+  theme_minimal()
+
+```
+
+
